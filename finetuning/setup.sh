@@ -31,7 +31,7 @@ rm -rf ~/.cache/huggingface
 rm -rf /workspace/.cache/huggingface
 
 # ── vLLM (required for measure_acceptance.py) ─────────────────────────────────
-pip install "vllm==0.19.0" --break-system-packages
+pip install "vllm==0.19.0" --break-system-packages --timeout 300
 
 # ── Torch with CUDA 12.8 (overwrites the torch that vLLM pulled in) ──────────
 pip install torch torchvision torchaudio \

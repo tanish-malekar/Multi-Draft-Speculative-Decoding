@@ -1,0 +1,39 @@
+{
+  "drafter": "Qwen/Qwen2.5-1.5B-Instruct",
+  "target": "Qwen/Qwen2.5-14B-Instruct",
+  "K": 5,
+  "per_domain": {
+    "code": {
+      "acceptance_rate": 0.6256,
+      "mean_accepted_length": 3.128,
+      "system_efficiency": 0.8256,
+      "num_accepted_tokens": 1564,
+      "num_draft_tokens": 2500,
+      "num_emitted_tokens": 2064,
+      "num_prompts": 500
+    },
+    "math": {
+      "acceptance_rate": 0.144,
+      "mean_accepted_length": 0.72,
+      "system_efficiency": 0.344,
+      "num_accepted_tokens": 360,
+      "num_draft_tokens": 2500,
+      "num_emitted_tokens": 860,
+      "num_prompts": 500
+    },
+    "translation": {
+      "acceptance_rate": 0.4984,
+      "mean_accepted_length": 2.492,
+      "system_efficiency": 0.6984,
+      "num_accepted_tokens": 1246,
+      "num_draft_tokens": 2500,
+      "num_emitted_tokens": 1746,
+      "num_prompts": 500
+    }
+  },
+  "overall": {
+    "acceptance_rate": 0.4227,
+    "mean_accepted_length": 2.1133,
+    "system_efficiency": 0.6227
+  }
+}

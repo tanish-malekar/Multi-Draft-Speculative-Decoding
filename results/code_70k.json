@@ -1,0 +1,64 @@
+{
+  "drafter": "checkpoints/code_70k/final",
+  "target": "Qwen/Qwen2.5-14B-Instruct",
+  "K": 5,
+  "generation_stop_sequences": {
+    "code": [
+      "\ndef ",
+      "\n    def ",
+      "\nclass ",
+      "\n    class ",
+      "\nimport ",
+      "\nfrom ",
+      "\n```",
+      "```",
+      "\n# Continue",
+      "\n# Add"
+    ],
+    "math": [],
+    "translation": [
+      "\n\n",
+      "\nTranslation:",
+      "\nNote:",
+      "\nTo stop",
+      "\nTo provide",
+      "\nAs per",
+      "\nTranslation complete",
+      "\nStopping here"
+    ]
+  },
+  "per_domain": {
+    "code": {
+      "acceptance_rate": 0.686,
+      "mean_accepted_length": 3.43,
+      "system_efficiency": 0.886,
+      "num_accepted_tokens": 1715,
+      "num_draft_tokens": 2500,
+      "num_emitted_tokens": 2215,
+      "num_prompts": 500
+    },
+    "math": {
+      "acceptance_rate": 0.1844,
+      "mean_accepted_length": 0.922,
+      "system_efficiency": 0.3844,
+      "num_accepted_tokens": 461,
+      "num_draft_tokens": 2500,
+      "num_emitted_tokens": 961,
+      "num_prompts": 500
+    },
+    "translation": {
+      "acceptance_rate": 0.538,
+      "mean_accepted_length": 2.69,
+      "system_efficiency": 0.738,
+      "num_accepted_tokens": 1345,
+      "num_draft_tokens": 2500,
+      "num_emitted_tokens": 1845,
+      "num_prompts": 500
+    }
+  },
+  "overall": {
+    "acceptance_rate": 0.4695,
+    "mean_accepted_length": 2.3473,
+    "system_efficiency": 0.6695
+  }
+}

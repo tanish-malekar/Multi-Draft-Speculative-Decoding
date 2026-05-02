@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-measure_acceptance.py — Speculative-decoding acceptance measurement via vLLM.
+measure_acceptance.py — Speculative-decoding acceptance measurement.
 
-Loads the target (14B) and drafter (1.5B or finetuned) into a single vLLM
-engine configured for speculative decoding, runs generation on held-out eval
-prompts, and captures vLLM's native SpecDecodeWorkerMetrics.
+Uses a manual full speculative-decoding loop that works despite vocabulary-size
+mismatches between drafter and target (e.g. Qwen2.5-1.5B vs 14B cannot be
+paired with vLLM's built-in speculative decoding):
 
-Per-domain runs are kept separate so each domain gets its own acceptance stats.
+  1. Drafter proposes up to K tokens from the current context.
+  2. Target scores the proposed tokens with prompt_logprobs.
+  3. Accepted tokens plus the target replacement/bonus token are appended.
+  4. The loop repeats until max_new_tokens, EOS, or domain stop strings.
 
-Reported metrics (standard speculative-decoding terminology):
-  acceptance_rate (α):      fraction of draft tokens the target accepted.
-  mean_accepted_length:     α × K — average accepted run per drafter call.
-  system_efficiency:        emitted tokens / draft tokens ≈ (K·α + 1) / K
-                            directly measures effective speedup over AR decoding.
+Reported metrics:
+  acceptance_rate (α):   fraction of draft positions where the draft token
+                         matches the target's greedy (argmax) prediction.
+  mean_accepted_length:  accepted tokens / speculative steps.
+  system_efficiency:     emitted tokens / draft tokens.
 
 Usage:
   # Baseline (base 1.5B drafter):
@@ -35,214 +38,377 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
 import time
+from dataclasses import dataclass
 from typing import Any
 
 DOMAINS = ["code", "math", "translation"]
 
 
 # ─────────────────────────────────────────────────────────
-# Spec-decode metrics capture
+# vLLM helpers
 # ─────────────────────────────────────────────────────────
 
-class SpecMetricsCapture:
-    """Accumulates SpecDecodeWorkerMetrics emitted by the vLLM stat logger."""
+def _load_llm(model: str, dtype: str, gpu_util: float, max_model_len: int) -> Any:
+    from vllm import LLM  # type: ignore[import]
+    return LLM(
+        model=model,
+        dtype=dtype,
+        gpu_memory_utilization=gpu_util,
+        max_model_len=max_model_len,
+        trust_remote_code=True,
+        disable_log_stats=True,
+    )
 
-    def __init__(self) -> None:
-        self.num_accepted: int = 0
-        self.num_draft: int = 0
-        self.num_emitted: int = 0
-        # Snapshots taken before each domain run so we can compute deltas.
-        self._snap_accepted: int = 0
-        self._snap_draft: int = 0
-        self._snap_emitted: int = 0
 
-    def snapshot(self) -> None:
-        """Record current totals; next call to delta_summary() gives since-snapshot stats."""
-        self._snap_accepted = self.num_accepted
-        self._snap_draft = self.num_draft
-        self._snap_emitted = self.num_emitted
+def _unload_llm(llm: Any) -> None:
+    """Release GPU memory used by a vLLM LLM instance."""
+    import torch
+    del llm
+    gc.collect()
+    torch.cuda.empty_cache()
 
-    def update(self, m: Any) -> None:
-        self.num_accepted += int(getattr(m, "num_accepted_tokens", 0) or 0)
-        self.num_draft += int(getattr(m, "num_draft_tokens", 0) or 0)
-        self.num_emitted += int(getattr(m, "num_emitted_tokens", 0) or 0)
 
-    def delta(self) -> tuple[int, int, int]:
-        return (
-            self.num_accepted - self._snap_accepted,
-            self.num_draft - self._snap_draft,
-            self.num_emitted - self._snap_emitted,
+# ─────────────────────────────────────────────────────────
+# Manual speculative decoding loop
+# ─────────────────────────────────────────────────────────
+
+def _stop_sequences_for_domain(domain: str) -> list[str]:
+    """Match dataset-generation.py stop sequences for teacher generation."""
+    if domain == "translation":
+        return [
+            "\n\n",
+            "\nTranslation:",
+            "\nNote:",
+            "\nTo stop",
+            "\nTo provide",
+            "\nAs per",
+            "\nTranslation complete",
+            "\nStopping here",
+        ]
+    if domain == "code":
+        return [
+            "\ndef ",
+            "\n    def ",
+            "\nclass ",
+            "\n    class ",
+            "\nimport ",
+            "\nfrom ",
+            "\n```",
+            "```",
+            "\n# Continue",
+            "\n# Add",
+        ]
+    return []
+
+
+@dataclass
+class SpecLoopState:
+    domain: str
+    prompt: str
+    target_ids: list[int]
+    drafter_ids: list[int]
+    generated_text: str = ""
+    generated_target_ids: list[int] | None = None
+    num_accepted: int = 0
+    num_draft: int = 0
+    num_emitted: int = 0
+    num_steps: int = 0
+    finished: bool = False
+    finish_reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.generated_target_ids is None:
+            self.generated_target_ids = []
+
+
+def _eos_token_ids(tokenizer: Any) -> set[int]:
+    eos = getattr(tokenizer, "eos_token_id", None)
+    if eos is None:
+        return set()
+    if isinstance(eos, list):
+        return {int(t) for t in eos if t is not None}
+    return {int(eos)}
+
+
+def _best_token(logprobs: Any) -> int | None:
+    if not logprobs:
+        return None
+    return int(max(logprobs, key=lambda t: logprobs[t].logprob))
+
+
+def _contains_stop(text: str, stop: list[str]) -> bool:
+    return any(s and s in text for s in stop)
+
+
+def _refresh_drafter_context(state: SpecLoopState, drafter_tokenizer: Any) -> None:
+    state.drafter_ids = drafter_tokenizer.encode(state.prompt + state.generated_text)
+
+
+def _append_target_tokens(
+    state: SpecLoopState,
+    token_ids: list[int],
+    target_tokenizer: Any,
+    drafter_tokenizer: Any,
+) -> None:
+    if not token_ids:
+        return
+    state.target_ids.extend(token_ids)
+    assert state.generated_target_ids is not None
+    state.generated_target_ids.extend(token_ids)
+    state.generated_text += target_tokenizer.decode(
+        token_ids,
+        skip_special_tokens=False,
+    )
+    _refresh_drafter_context(state, drafter_tokenizer)
+
+
+def _state_result(state: SpecLoopState) -> dict[str, Any]:
+    return {
+        "num_accepted_tokens": state.num_accepted,
+        "num_draft_tokens": state.num_draft,
+        "num_emitted_tokens": state.num_emitted,
+        "num_generated_tokens": len(state.generated_target_ids or []),
+        "num_steps": state.num_steps,
+        "finish_reason": state.finish_reason or "unknown",
+    }
+
+
+def _run_speculative_loop(
+    drafter_model: str,
+    target_model: str,
+    prompts_by_domain: dict[str, list[str]],
+    domains: list[str],
+    K: int,
+    max_new_tokens: int,
+    dtype: str,
+    drafter_gpu_util: float,
+    target_gpu_util: float,
+    max_model_len: int,
+) -> list[dict[str, Any]]:
+    """
+    Run a full greedy speculative-decoding loop.
+
+    Each iteration drafts up to K tokens, verifies the draft with the target,
+    appends the accepted prefix plus the target replacement/bonus token, and
+    repeats until max_new_tokens, EOS, or the domain stop strings are reached.
+    """
+    from vllm import SamplingParams  # type: ignore[import]
+
+    max_context_len = max_model_len - K - 1
+    if max_context_len <= 0:
+        raise ValueError(
+            f"max_model_len={max_model_len} is too small for K={K}; "
+            "increase --max_model_len or lower --num_speculative_tokens."
         )
 
-    def delta_summary(self, K: int) -> dict[str, Any]:
-        accepted, draft, emitted = self.delta()
-        if draft == 0:
-            return {
-                "acceptance_rate": None,
-                "mean_accepted_length": None,
-                "system_efficiency": None,
-                "num_accepted_tokens": accepted,
-                "num_draft_tokens": draft,
-                "num_emitted_tokens": emitted,
-                "note": "No draft-token counts received from vLLM — see fallback note below.",
-            }
-        alpha = accepted / draft
-        # system_efficiency = emitted / draft tokens; theoretically (K*alpha+1)/K for greedy
-        sys_eff = emitted / draft if draft else None
-        return {
-            "acceptance_rate": round(alpha, 4),
-            "mean_accepted_length": round(alpha * K, 4),
-            "system_efficiency": round(sys_eff, 4) if sys_eff is not None else None,
-            "num_accepted_tokens": accepted,
-            "num_draft_tokens": draft,
-            "num_emitted_tokens": emitted,
-        }
+    print("  Loading target and drafter for manual speculative loop...")
+    target_llm: Any | None = None
+    drafter_llm: Any | None = None
 
-
-def _try_inject_stat_logger(llm: Any, capture: SpecMetricsCapture) -> bool:
-    """
-    Inject a custom StatLoggerBase into the vLLM engine to capture
-    SpecDecodeWorkerMetrics on every logging tick.
-
-    Returns True if injection succeeded.
-    """
+    results: list[dict[str, Any]] = []
     try:
-        from vllm.engine.metrics import StatLoggerBase  # type: ignore[import]
+        target_llm = _load_llm(target_model, dtype, target_gpu_util, max_model_len)
+        drafter_llm = _load_llm(drafter_model, dtype, drafter_gpu_util, max_model_len)
+        target_tokenizer = target_llm.get_tokenizer()
+        drafter_tokenizer = drafter_llm.get_tokenizer()
+        target_eos_ids = _eos_token_ids(target_tokenizer)
 
-        cap = capture
+        for domain in domains:
+            stop = _stop_sequences_for_domain(domain)
+            states = [
+                SpecLoopState(
+                    domain=domain,
+                    prompt=prompt,
+                    target_ids=target_tokenizer.encode(prompt),
+                    drafter_ids=drafter_tokenizer.encode(prompt),
+                )
+                for prompt in prompts_by_domain[domain]
+            ]
+            print(
+                f"  [{domain}] Running full loop on {len(states):,} prompts "
+                f"with {len(stop)} stop sequences."
+            )
 
-        class _Hook(StatLoggerBase):
-            def info(self, type_: str, obj: Any) -> None:  # noqa: A002
-                pass
+            round_idx = 0
+            while True:
+                active = [
+                    s for s in states
+                    if not s.finished
+                    and len(s.generated_target_ids or []) < max_new_tokens
+                ]
+                if not active:
+                    break
 
-            def log(self, stats: Any) -> None:
-                m = getattr(stats, "spec_decode_metrics", None)
-                if m is not None:
-                    cap.update(m)
+                round_idx += 1
+                if round_idx == 1 or round_idx % 10 == 0:
+                    print(
+                        f"  [{domain}] round {round_idx}: "
+                        f"{len(active):,} active prompts"
+                    )
 
-        engine = getattr(llm, "llm_engine", None)
-        if engine is None:
-            return False
-        loggers = getattr(engine, "stat_loggers", None)
-        if isinstance(loggers, dict):
-            loggers["_capture"] = _Hook(local_interval=0, logger=None)  # type: ignore[call-arg]
-            return True
-        return False
-    except Exception as e:
-        print(f"  ⚠  Stat-logger injection failed ({e}).")
-        print("     Trying direct worker-counter fallback instead.")
-        return False
+                draft_inputs = [
+                    {"prompt_token_ids": s.drafter_ids[-max_context_len:]}
+                    for s in active
+                ]
+                draft_sp = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=K,
+                    stop=stop,
+                    ignore_eos=False,
+                )
+                draft_outputs = drafter_llm.generate(draft_inputs, draft_sp)
 
+                target_inputs: list[dict[str, list[int]]] = []
+                target_context_lens: list[int] = []
+                draft_ids_list: list[list[int]] = []
+                drafter_stopped: list[bool] = []
 
-def _try_hook_logger_simple(llm: Any, capture: SpecMetricsCapture) -> bool:
-    """
-    Simpler injection that doesn't need StatLoggerBase constructor args.
-    Tries to monkey-patch the log method of an existing logger.
-    """
-    try:
-        engine = getattr(llm, "llm_engine", None)
-        if engine is None:
-            return False
-        loggers = getattr(engine, "stat_loggers", None)
-        if not isinstance(loggers, dict):
-            return False
+                for state, out in zip(active, draft_outputs):
+                    remaining = max_new_tokens - len(state.generated_target_ids or [])
+                    choice = out.outputs[0]
+                    d_ids = list(choice.token_ids[: min(K, remaining)])
+                    finish_reason = str(getattr(choice, "finish_reason", "") or "")
+                    stopped = finish_reason not in {"", "length", "None"}
 
-        cap = capture
+                    if not d_ids:
+                        state.finished = True
+                        state.finish_reason = (
+                            f"drafter_{finish_reason}" if finish_reason else "drafter_stop"
+                        )
+                        continue
 
-        class _Hook:
-            def info(self, *a: Any, **kw: Any) -> None:
-                pass
+                    target_context = state.target_ids[-max_context_len:]
+                    target_inputs.append({"prompt_token_ids": target_context + d_ids})
+                    target_context_lens.append(len(target_context))
+                    draft_ids_list.append(d_ids)
+                    drafter_stopped.append(stopped)
 
-            def log(self, stats: Any) -> None:
-                m = getattr(stats, "spec_decode_metrics", None)
-                if m is not None:
-                    cap.update(m)
+                if not target_inputs:
+                    continue
 
-        loggers["_capture"] = _Hook()
-        return True
-    except Exception as e:
-        print(f"  ⚠  Simple logger injection also failed ({e}).")
-        return False
+                target_sp = SamplingParams(
+                    temperature=0.0,
+                    max_tokens=1,
+                    prompt_logprobs=1,
+                    stop=stop,
+                    ignore_eos=False,
+                )
+                target_outputs = target_llm.generate(target_inputs, target_sp)
 
+                scored_states = [s for s in active if not s.finished]
+                for state, d_ids, prompt_len, stopped, out in zip(
+                    scored_states,
+                    draft_ids_list,
+                    target_context_lens,
+                    drafter_stopped,
+                    target_outputs,
+                ):
+                    state.num_steps += 1
+                    state.num_draft += len(d_ids)
+                    plp = out.prompt_logprobs
 
-def _try_read_worker_counters(llm: Any, capture: SpecMetricsCapture) -> bool:
-    """
-    Fallback: read spec-decode counters directly from the driver worker
-    after generation completes.
-    """
-    try:
-        engine = getattr(llm, "llm_engine", None)
-        if engine is None:
-            return False
-        driver_worker = getattr(engine, "driver_worker", None)
-        if driver_worker is None:
-            return False
-        sd_worker = getattr(driver_worker, "spec_decode_worker", None)
-        if sd_worker is None:
-            return False
-        # Try common attribute paths used across vLLM versions
-        for attr in ("metrics_collector", "metrics", "_metrics"):
-            m = getattr(sd_worker, attr, None)
-            if m is not None:
-                capture.update(m)
-                return True
-        return False
-    except Exception:
-        return False
+                    accepted = 0
+                    replacement_tok: int | None = None
+                    for j, d_tok in enumerate(d_ids):
+                        pos = prompt_len + j
+                        if plp is None or pos >= len(plp) or plp[pos] is None:
+                            replacement_tok = None
+                            break
+                        best_tok = _best_token(plp[pos])
+                        if best_tok is None:
+                            replacement_tok = None
+                            break
+                        if d_tok == best_tok:
+                            accepted += 1
+                            continue
+                        replacement_tok = best_tok
+                        break
 
+                    accepted_ids = d_ids[:accepted]
+                    if accepted_ids:
+                        _append_target_tokens(
+                            state,
+                            accepted_ids,
+                            target_tokenizer,
+                            drafter_tokenizer,
+                        )
+                        state.num_accepted += accepted
+                        state.num_emitted += accepted
 
-# ─────────────────────────────────────────────────────────
-# vLLM engine construction
-# ─────────────────────────────────────────────────────────
+                    if _contains_stop(state.generated_text, stop):
+                        state.finished = True
+                        state.finish_reason = "stop"
+                        continue
+                    if accepted_ids and accepted_ids[-1] in target_eos_ids:
+                        state.finished = True
+                        state.finish_reason = "eos"
+                        continue
+                    if len(state.generated_target_ids or []) >= max_new_tokens:
+                        state.finished = True
+                        state.finish_reason = "length"
+                        continue
 
-def build_llm(args: Any) -> Any:
-    """
-    Initialise a vLLM LLM with speculative decoding.
-    Tries multiple API forms to handle different vLLM versions.
-    """
-    from vllm import LLM  # type: ignore[import]
+                    if accepted == len(d_ids):
+                        if stopped:
+                            state.finished = True
+                            state.finish_reason = "drafter_stop"
+                            continue
 
-    common_kwargs: dict[str, Any] = dict(
-        model=args.target,
-        dtype=args.dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-        trust_remote_code=True,
-        disable_log_stats=False,
-    )
+                        bonus_ids = list(out.outputs[0].token_ids[:1])
+                        if not bonus_ids:
+                            state.finished = True
+                            state.finish_reason = (
+                                str(getattr(out.outputs[0], "finish_reason", "") or "target_stop")
+                            )
+                            continue
+                        _append_target_tokens(
+                            state,
+                            bonus_ids,
+                            target_tokenizer,
+                            drafter_tokenizer,
+                        )
+                        state.num_emitted += len(bonus_ids)
+                        if bonus_ids[-1] in target_eos_ids:
+                            state.finished = True
+                            state.finish_reason = "eos"
+                        elif _contains_stop(state.generated_text, stop):
+                            state.finished = True
+                            state.finish_reason = "stop"
+                    else:
+                        if replacement_tok is None:
+                            state.finished = True
+                            state.finish_reason = "missing_target_logprob"
+                            continue
+                        _append_target_tokens(
+                            state,
+                            [replacement_tok],
+                            target_tokenizer,
+                            drafter_tokenizer,
+                        )
+                        state.num_emitted += 1
+                        if replacement_tok in target_eos_ids:
+                            state.finished = True
+                            state.finish_reason = "eos"
+                        elif _contains_stop(state.generated_text, stop):
+                            state.finished = True
+                            state.finish_reason = "stop"
 
-    spec_variants = [
-        # vLLM ≥ 0.6: speculative_config dict
-        {"speculative_config": {
-            "model": args.drafter,
-            "num_speculative_tokens": args.num_speculative_tokens,
-        }},
-        # Older vLLM: separate keyword args
-        {
-            "speculative_model": args.drafter,
-            "num_speculative_tokens": args.num_speculative_tokens,
-        },
-    ]
+            for state in states:
+                if not state.finished:
+                    state.finish_reason = "length"
+                results.append(_state_result(state))
+    finally:
+        if drafter_llm is not None:
+            _unload_llm(drafter_llm)
+        if target_llm is not None:
+            _unload_llm(target_llm)
 
-    last_err: Exception | None = None
-    for spec_kw in spec_variants:
-        try:
-            llm = LLM(**common_kwargs, **spec_kw)
-            print(f"  ✓ vLLM loaded with spec kwargs: {list(spec_kw.keys())}")
-            return llm
-        except Exception as e:
-            last_err = e
-            print(f"  Tried {list(spec_kw.keys())}: {e}")
-
-    raise RuntimeError(
-        "Failed to initialise vLLM with speculative decoding. "
-        f"Last error: {last_err}\n"
-        "Check vLLM version compatibility and that both model paths exist."
-    )
+    return results
 
 
 # ─────────────────────────────────────────────────────────
@@ -270,34 +436,6 @@ def load_eval_prompts(
     rng = random.Random(seed)
     rng.shuffle(prompts)
     return prompts[:max_eval]
-
-
-# ─────────────────────────────────────────────────────────
-# Per-domain measurement
-# ─────────────────────────────────────────────────────────
-
-def measure_domain(
-    llm: Any,
-    capture: SpecMetricsCapture,
-    prompts: list[str],
-    sp: Any,
-    K: int,
-    has_logger: bool,
-) -> dict[str, Any]:
-    capture.snapshot()
-    t0 = time.time()
-    llm.generate(prompts, sp)
-    elapsed = time.time() - t0
-
-    # If logger injection failed, attempt direct counter read after generate()
-    if not has_logger:
-        _try_read_worker_counters(llm, capture)
-
-    result = capture.delta_summary(K)
-    result["num_prompts"] = len(prompts)
-    result["total_time_s"] = round(elapsed, 2)
-    result["throughput_prompts_per_s"] = round(len(prompts) / max(elapsed, 1e-6), 2)
-    return result
 
 
 # ─────────────────────────────────────────────────────────
@@ -372,9 +510,8 @@ def compare_and_print(base_path: str, ft_path: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure speculative-decoding acceptance rate using vLLM. "
-            "Runs the target + drafter together and reports α, mean accepted "
-            "length, and system efficiency per domain."
+            "Measure speculative-decoding acceptance rate using a manual full "
+            "drafter→target loop. Works with mismatched vocabulary sizes."
         )
     )
     parser.add_argument(
@@ -397,13 +534,24 @@ def main() -> None:
     )
     parser.add_argument(
         "--max_new_tokens", type=int, default=160,
-        help="Maximum tokens to generate per prompt.",
+        help="Maximum generated tokens per prompt in the full speculative loop.",
     )
     parser.add_argument(
         "--max_eval_per_domain", type=int, default=500,
         help="Cap on prompts per domain (shuffled; keeps eval time reasonable).",
     )
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.90)
+    parser.add_argument(
+        "--gpu_memory_utilization",
+        type=float,
+        default=0.70,
+        help="Target-model vLLM GPU fraction. Lowered by default so drafter can stay loaded.",
+    )
+    parser.add_argument(
+        "--drafter_gpu_memory_utilization",
+        type=float,
+        default=0.20,
+        help="Drafter-model vLLM GPU fraction for the manual full loop.",
+    )
     parser.add_argument("--max_model_len", type=int, default=1024)
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument(
@@ -421,85 +569,144 @@ def main() -> None:
         compare_and_print(args.compare[0], args.compare[1])
         return
 
-    from vllm import SamplingParams  # type: ignore[import]
+    K = args.num_speculative_tokens
 
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
 ║  Speculative-Decoding Acceptance Measurement             ║
 ║  Target:   {args.target:<45}║
 ║  Drafter:  {args.drafter:<45}║
-║  K={args.num_speculative_tokens}  max_eval/domain={args.max_eval_per_domain:<4}  max_new_tokens={args.max_new_tokens:<6}   ║
+║  K={K}  max_new_tokens={args.max_new_tokens:<4}  max_model_len={args.max_model_len:<6} ║
 ╚══════════════════════════════════════════════════════════╝
 """)
 
-    # ── Build vLLM engine ──────────────────────────────────────────────────────
-    print("  Loading models via vLLM...")
-    llm = build_llm(args)
+    # ── Collect all prompts across domains ──────────────────────────────────────
+    all_prompts: list[str] = []
+    prompts_by_domain: dict[str, list[str]] = {}
+    domain_slices: dict[str, tuple[int, int]] = {}
 
-    # ── Inject metrics capture ─────────────────────────────────────────────────
-    capture = SpecMetricsCapture()
-    has_logger = (
-        _try_inject_stat_logger(llm, capture)
-        or _try_hook_logger_simple(llm, capture)
-    )
-    if has_logger:
-        print("  ✓ Spec-decode metrics capture injected into vLLM stat logger.")
-    else:
-        print(
-            "  ⚠  Logger injection failed. Will attempt direct worker-counter read "
-            "after each domain run (less precise but still informative)."
-        )
-
-    sp = SamplingParams(temperature=0.0, max_tokens=args.max_new_tokens)
-
-    # ── Per-domain evaluation ──────────────────────────────────────────────────
-    per_domain: dict[str, dict[str, Any]] = {}
     for domain in args.domains:
-        print(f"\n  [{domain}] Loading up to {args.max_eval_per_domain:,} eval prompts...")
         prompts = load_eval_prompts(
             args.eval_dir, domain, args.max_eval_per_domain, args.seed
         )
-        print(f"  [{domain}] Running speculative decoding on {len(prompts):,} prompts...")
-        result = measure_domain(llm, capture, prompts, sp, args.num_speculative_tokens, has_logger)
-        per_domain[domain] = result
-        alpha = result.get("acceptance_rate")
-        mal = result.get("mean_accepted_length")
-        eff = result.get("system_efficiency")
-        print(
-            f"  [{domain}] α={_fmt(alpha)}  "
-            f"mean_accepted_len={_fmt(mal)}  "
-            f"system_efficiency={_fmt(eff)}  "
-            f"({len(prompts):,} prompts in {result['total_time_s']:.1f}s)"
-        )
-        if result.get("note"):
-            print(f"  [{domain}] ⚠  {result['note']}")
+        prompts_by_domain[domain] = prompts
+        start = len(all_prompts)
+        all_prompts.extend(prompts)
+        domain_slices[domain] = (start, len(all_prompts))
+        print(f"  [{domain}] {len(prompts):,} eval prompts loaded.")
 
-    # ── Overall aggregation ────────────────────────────────────────────────────
+    print(f"\n  Total prompts: {len(all_prompts):,}")
+
+    # ── Full speculative loop ───────────────────────────────────────────────────
+    print("\n  ── Full speculative loop ───────────────────────────────────────────────")
+    t0 = time.time()
+    per_prompt = _run_speculative_loop(
+        drafter_model=args.drafter,
+        target_model=args.target,
+        prompts_by_domain=prompts_by_domain,
+        domains=args.domains,
+        K=K,
+        max_new_tokens=args.max_new_tokens,
+        dtype=args.dtype,
+        drafter_gpu_util=args.drafter_gpu_memory_utilization,
+        target_gpu_util=args.gpu_memory_utilization,
+        max_model_len=args.max_model_len,
+    )
+    print(f"  Full loop runtime: {time.time() - t0:.1f}s")
+
+    # ── Aggregate per domain ────────────────────────────────────────────────────
+    print()
+    per_domain: dict[str, dict[str, Any]] = {}
+    for domain in args.domains:
+        start, end = domain_slices[domain]
+        slice_results = per_prompt[start:end]
+        num_accepted = sum(r["num_accepted_tokens"] for r in slice_results)
+        num_draft = sum(r["num_draft_tokens"] for r in slice_results)
+        num_emitted = sum(r["num_emitted_tokens"] for r in slice_results)
+        num_generated = sum(r["num_generated_tokens"] for r in slice_results)
+        num_steps = sum(r["num_steps"] for r in slice_results)
+        finish_reasons: dict[str, int] = {}
+        for r in slice_results:
+            reason = str(r.get("finish_reason", "unknown"))
+            finish_reasons[reason] = finish_reasons.get(reason, 0) + 1
+        n_prompts = end - start
+
+        if num_draft == 0:
+            result: dict[str, Any] = {
+                "acceptance_rate": None,
+                "mean_accepted_length": None,
+                "system_efficiency": None,
+                "num_accepted_tokens": 0,
+                "num_draft_tokens": 0,
+                "num_emitted_tokens": 0,
+                "num_generated_tokens": num_generated,
+                "num_steps": num_steps,
+                "num_prompts": n_prompts,
+                "finish_reasons": finish_reasons,
+            }
+        else:
+            alpha = num_accepted / num_draft
+            result = {
+                "acceptance_rate": round(alpha, 4),
+                "mean_accepted_length": (
+                    round(num_accepted / num_steps, 4) if num_steps else None
+                ),
+                "system_efficiency": round(num_emitted / num_draft, 4),
+                "num_accepted_tokens": num_accepted,
+                "num_draft_tokens": num_draft,
+                "num_emitted_tokens": num_emitted,
+                "num_generated_tokens": num_generated,
+                "num_steps": num_steps,
+                "num_prompts": n_prompts,
+                "finish_reasons": finish_reasons,
+            }
+
+        per_domain[domain] = result
+        print(
+            f"  [{domain}] "
+            f"α={_fmt(result.get('acceptance_rate'))}  "
+            f"mean_accepted_len={_fmt(result.get('mean_accepted_length'))}  "
+            f"system_efficiency={_fmt(result.get('system_efficiency'))}  "
+            f"({n_prompts:,} prompts)"
+        )
+
+    # ── Overall aggregation ─────────────────────────────────────────────────────
     total_acc = sum(r.get("num_accepted_tokens", 0) or 0 for r in per_domain.values())
     total_dft = sum(r.get("num_draft_tokens", 0) or 0 for r in per_domain.values())
     total_emi = sum(r.get("num_emitted_tokens", 0) or 0 for r in per_domain.values())
+    total_gen = sum(r.get("num_generated_tokens", 0) or 0 for r in per_domain.values())
+    total_steps = sum(r.get("num_steps", 0) or 0 for r in per_domain.values())
 
-    K = args.num_speculative_tokens
     if total_dft > 0:
         oa = total_acc / total_dft
         overall: dict[str, Any] = {
             "acceptance_rate": round(oa, 4),
-            "mean_accepted_length": round(oa * K, 4),
+            "mean_accepted_length": (
+                round(total_acc / total_steps, 4) if total_steps else None
+            ),
             "system_efficiency": round(total_emi / total_dft, 4),
+            "num_generated_tokens": total_gen,
+            "num_steps": total_steps,
         }
     else:
         overall = {
             "acceptance_rate": None,
             "mean_accepted_length": None,
             "system_efficiency": None,
-            "note": "No draft-token counts — metrics not available for this vLLM version.",
+            "num_generated_tokens": total_gen,
+            "num_steps": total_steps,
         }
 
-    # ── Write output ───────────────────────────────────────────────────────────
+    # ── Write output ────────────────────────────────────────────────────────────
     output = {
         "drafter": args.drafter,
         "target": args.target,
         "K": K,
+        "max_new_tokens": args.max_new_tokens,
+        "mode": "manual_full_speculative_loop",
+        "generation_stop_sequences": {
+            domain: _stop_sequences_for_domain(domain) for domain in args.domains
+        },
         "per_domain": per_domain,
         "overall": overall,
     }
@@ -510,7 +717,7 @@ def main() -> None:
         json.dump(output, f, indent=2)
     print(f"\n  ✓ Results written to: {args.output_json}")
 
-    # ── Summary table ──────────────────────────────────────────────────────────
+    # ── Summary table ───────────────────────────────────────────────────────────
     print(f"\n  {'Domain':<14}  {'α':>8}  {'mean len':>10}  {'sys eff':>10}")
     print("  " + "-" * 48)
     for domain, r in per_domain.items():

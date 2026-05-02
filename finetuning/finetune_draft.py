@@ -40,6 +40,8 @@ from __future__ import annotations
 import argparse
 import glob
 import hashlib
+import importlib.metadata
+import importlib.util
 import json
 import os
 import random
@@ -238,6 +240,57 @@ def check_manifest(output_dir: str, args: Any) -> None:
 
 
 # ─────────────────────────────────────────────────────────
+# Environment checks
+# ─────────────────────────────────────────────────────────
+
+def _version_tuple(version: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for part in version.split("."):
+        digits = ""
+        for ch in part:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if digits:
+            parts.append(int(digits))
+    return tuple(parts)
+
+
+def require_training_dependencies(use_lora: bool) -> None:
+    missing: list[str] = []
+    too_old: list[str] = []
+
+    if importlib.util.find_spec("accelerate") is None:
+        missing.append("accelerate>=0.26.0")
+    else:
+        version = importlib.metadata.version("accelerate")
+        if _version_tuple(version) < (0, 26, 0):
+            too_old.append(f"accelerate {version} installed, need >=0.26.0")
+
+    if use_lora and importlib.util.find_spec("peft") is None:
+        missing.append("peft>=0.12")
+
+    if not missing and not too_old:
+        return
+
+    details = []
+    if missing:
+        details.append("missing: " + ", ".join(missing))
+    if too_old:
+        details.append("too old: " + ", ".join(too_old))
+
+    packages = ["'accelerate>=0.26.0'"]
+    if use_lora:
+        packages.append("'peft>=0.12'")
+
+    raise SystemExit(
+        "Training dependencies are not ready (" + "; ".join(details) + ").\n"
+        "Install them, then re-run the same command:\n"
+        f"  pip install {' '.join(packages)} --break-system-packages"
+    )
+
+
+# ─────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────
 
@@ -295,6 +348,7 @@ def main() -> None:
 
     # Resolve domains
     args.domains = DOMAINS if "all" in args.domains else sorted(set(args.domains))
+    require_training_dependencies(args.lora)
 
     # Handle --fresh
     if args.fresh and os.path.exists(args.output_dir):
@@ -337,7 +391,7 @@ def main() -> None:
     # ── Model ──────────────────────────────────────────────────────────────────
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
     )
 
@@ -384,7 +438,7 @@ def main() -> None:
         args=training_args,
         train_dataset=dataset,
         data_collator=collator,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     # ── Resume ─────────────────────────────────────────────────────────────────

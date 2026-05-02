@@ -1,0 +1,87 @@
+{
+  "drafter": "checkpoints/translation_70k/final",
+  "target": "Qwen/Qwen2.5-14B-Instruct",
+  "K": 5,
+  "max_new_tokens": 160,
+  "mode": "manual_full_speculative_loop",
+  "generation_stop_sequences": {
+    "code": [
+      "\ndef ",
+      "\n    def ",
+      "\nclass ",
+      "\n    class ",
+      "\nimport ",
+      "\nfrom ",
+      "\n```",
+      "```",
+      "\n# Continue",
+      "\n# Add"
+    ],
+    "math": [],
+    "translation": [
+      "\n\n",
+      "\nTranslation:",
+      "\nNote:",
+      "\nTo stop",
+      "\nTo provide",
+      "\nAs per",
+      "\nTranslation complete",
+      "\nStopping here"
+    ]
+  },
+  "per_domain": {
+    "code": {
+      "acceptance_rate": 0.5715,
+      "mean_accepted_length": 2.7951,
+      "system_efficiency": 0.7661,
+      "num_accepted_tokens": 26162,
+      "num_draft_tokens": 45780,
+      "num_emitted_tokens": 35073,
+      "num_generated_tokens": 35073,
+      "num_steps": 9360,
+      "num_prompts": 500,
+      "finish_reasons": {
+        "drafter_stop": 353,
+        "length": 55,
+        "stop": 92
+      }
+    },
+    "math": {
+      "acceptance_rate": 0.7057,
+      "mean_accepted_length": 3.4614,
+      "system_efficiency": 0.8985,
+      "num_accepted_tokens": 30813,
+      "num_draft_tokens": 43665,
+      "num_emitted_tokens": 39232,
+      "num_generated_tokens": 39232,
+      "num_steps": 8902,
+      "num_prompts": 500,
+      "finish_reasons": {
+        "drafter_stop": 451,
+        "length": 49
+      }
+    },
+    "translation": {
+      "acceptance_rate": 0.6429,
+      "mean_accepted_length": 3.0865,
+      "system_efficiency": 0.8308,
+      "num_accepted_tokens": 11494,
+      "num_draft_tokens": 17877,
+      "num_emitted_tokens": 14852,
+      "num_generated_tokens": 14852,
+      "num_steps": 3724,
+      "num_prompts": 500,
+      "finish_reasons": {
+        "drafter_stop": 362,
+        "stop": 138
+      }
+    }
+  },
+  "overall": {
+    "acceptance_rate": 0.638,
+    "mean_accepted_length": 3.1142,
+    "system_efficiency": 0.8307,
+    "num_generated_tokens": 89157,
+    "num_steps": 21986
+  }
+}

@@ -65,11 +65,16 @@ python finetuning/measure_acceptance.py \
     --output_json results/base.json
 ```
 
-**What it does:** loads both models into a single vLLM engine with speculative
-decoding enabled, generates on 500 prompts per domain, and captures
-`SpecDecodeWorkerMetrics` (α, mean accepted length, system efficiency).
+**What it does:** runs a manual full speculative-decoding loop. The drafter
+proposes up to `K` tokens, the target scores them with `prompt_logprobs`, the
+accepted prefix plus the target replacement/bonus token is appended to the
+context, and the loop repeats until `--max_new_tokens`, EOS, or the domain stop
+strings. This avoids vLLM's built-in requirement that target and draft
+vocabularies have the same size.
 
-**Expected runtime:** ~20–30 min on A100 80GB (both models load together: 14B + 1.5B ≈ 31 GB).
+**Expected runtime:** slower than vLLM native speculative decoding. The manual
+loop keeps both vLLM model instances loaded and alternates batched drafter and
+target calls.
 
 **Expected baseline numbers** (untrained 1.5B vs 14B, K=5):
 
@@ -249,9 +254,11 @@ because they were not in the training set.
 | `--eval_dir` | `datasets/eval_split` | Where `<domain>_eval.jsonl` files live |
 | `--domains` | all three | Which domains to evaluate |
 | `--num_speculative_tokens` | `5` | K — draft tokens proposed per step |
-| `--max_new_tokens` | `160` | Max tokens generated per prompt |
+| `--max_new_tokens` | `160` | Maximum generated tokens per prompt in the full loop |
 | `--max_eval_per_domain` | `500` | Prompts per domain (shuffled) |
-| `--gpu_memory_utilization` | `0.90` | vLLM GPU fraction |
+| `--gpu_memory_utilization` | `0.70` | Target-model vLLM GPU fraction |
+| `--drafter_gpu_memory_utilization` | `0.20` | Drafter-model vLLM GPU fraction |
+| `--max_model_len` | `1024` | Tokenized prompt + draft length cap used during measurement |
 | `--output_json` | `results/acceptance.json` | Output file |
 | `--compare A B` | — | Print diff table between two result JSONs and exit |
 
@@ -281,17 +288,23 @@ fills most of the GPU. Run Steps 1 and 3 (eval) without the trainer loaded.
 → You changed `--domains`, `--num_samples`, or `--seed` from the original run.
   Either restore the original args or pass `--fresh`.
 
+**`Target and draft model should have the same vocabulary size`**
+→ You are running an older copy of `measure_acceptance.py` that tries to use
+  vLLM's built-in speculative decoding. `Qwen/Qwen2.5-14B-Instruct` has vocab
+  size 152064, while `Qwen/Qwen2.5-1.5B-Instruct` has vocab size 151936, so vLLM
+  rejects that pair. Use the current manual-loop `measure_acceptance.py` in this
+  repo; it does not pass `speculative_config` to vLLM.
+
 **`Failed to initialise vLLM with speculative decoding`**
-→ vLLM version mismatch. Confirm `vllm==0.19.0` is installed (`pip show vllm`).
-  Both model paths must exist and be accessible.
+→ Same root cause as above if the error mentions `speculative_config`,
+  `speculative_model`, or vocabulary size. Re-run with the current script.
 
 **CUDA OOM during training**
 → Reduce `--batch_size 4` or add `--grad_accum 8` to keep effective batch the same.
 
 **CUDA OOM during eval**
-→ Reduce `--gpu_memory_utilization 0.85` or `--max_eval_per_domain 200`.
+→ Reduce `--gpu_memory_utilization 0.65`, reduce
+  `--drafter_gpu_memory_utilization 0.15`, or lower `--max_eval_per_domain`.
 
-**`acceptance_rate: null` in output JSON**
-→ vLLM's internal API for spec-decode metrics changed. The script logs a warning
-  and falls back to a direct worker-counter read. If both fail, `null` is written.
-  Check the vLLM version and the warning message printed during the run.
+**`max_model_len is too small`**
+→ Increase `--max_model_len` or lower `--num_speculative_tokens`.
