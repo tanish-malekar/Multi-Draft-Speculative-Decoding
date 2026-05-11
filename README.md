@@ -1,8 +1,6 @@
 # NLP Project: Speculative Decoding Drafter Distillation
 
-This project generates distillation data from a large target model, fine-tunes a
-small draft model with KL distillation, and evaluates speculative decoding
-acceptance against the target model.
+This project generates distillation data from a large target model, fine-tunes multiple task-specific draft models with KL distillation, and evaluates speculative decoding acceptance against the target model.
 
 The default setup uses:
 
