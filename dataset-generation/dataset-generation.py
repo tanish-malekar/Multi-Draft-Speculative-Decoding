@@ -14,7 +14,7 @@ Prompts are domain-specific and output-only. Code prompts use the partial code o
 Rows are filtered by combined (docstring + code) token length before inference.
 
 Example:
-python /workspace/distillation/dataset-generation.py   --samples_per_domain 100   --model_name Qwen/Qwen2.5-14B-Instruct   --batch_size 128  --output_dir /workspace/distillation/distillation_data   --domains all --dtype bfloat16   --gpu_memory_utilization 0.90   --max_model_len 1024   --temperature 0.0   --checkpoint_every 100   --oversample_factor 1.0   --fresh
+python /workspace/distillation/dataset-generation.py   --samples_per_domain 100   --model_name Qwen/Qwen3-8B   --batch_size 128  --output_dir /workspace/distillation/distillation_data   --domains all --dtype bfloat16   --gpu_memory_utilization 0.90   --max_model_len 1024   --temperature 0.0   --top_logprobs 64   --checkpoint_every 100   --oversample_factor 1.0   --fresh
 """
 
 from __future__ import annotations
@@ -929,6 +929,26 @@ def load_domain_prompts(
 # 8. TEACHER INFERENCE
 # ═══════════════════════════════════════════════
 
+def serialize_generation_logprobs(logprobs: Any) -> list[list[dict[str, float | int]]]:
+    """Convert vLLM's generated-token logprob objects into JSON-friendly top-k rows."""
+    if not logprobs:
+        return []
+
+    rows: list[list[dict[str, float | int]]] = []
+    for position in logprobs:
+        if not position:
+            rows.append([])
+            continue
+        entries: list[dict[str, float | int]] = []
+        for token_id, token_info in position.items():
+            entries.append({
+                "token_id": int(token_id),
+                "logprob": float(token_info.logprob),
+            })
+        entries.sort(key=lambda item: item["logprob"], reverse=True)
+        rows.append(entries)
+    return rows
+
 def run_teacher_inference(
     prompt_records: list[dict[str, Any]],
     domain: str,
@@ -941,6 +961,7 @@ def run_teacher_inference(
     gpu_memory_utilization: float,
     dtype: str,
     temperature: float,
+    top_logprobs: int,
 ):
     from vllm import LLM, SamplingParams
 
@@ -990,6 +1011,7 @@ def run_teacher_inference(
         "max_tokens": max_tokens,
         "min_tokens": 3,
         "stop": stop,
+        "logprobs": top_logprobs,
     }
     try:
         sampling_params = SamplingParams(**sampling_kwargs)
@@ -1000,7 +1022,7 @@ def run_teacher_inference(
 
     print(f"\n    Loading model: {model_name}")
     print(f"    dtype={dtype} | gpu_memory_utilization={gpu_memory_utilization} | max_model_len={max_model_len}")
-    print(f"    max_new_tokens[{domain}]={max_tokens}; outputs that hit this limit will be rejected during filtering")
+    print(f"    max_new_tokens[{domain}]={max_tokens}; top_logprobs={top_logprobs}; outputs that hit this limit will be rejected during filtering")
 
     llm = LLM(
         model=model_name,
@@ -1032,14 +1054,20 @@ def run_teacher_inference(
                 raise
 
             for (prompt_index, rec), out in zip(batch_items, outputs):
-                response = out.outputs[0].text
+                completion = out.outputs[0]
+                response = completion.text
                 out_rec = {
                     "domain": domain,
                     "prompt_index": prompt_index,
                     "source_dataset": rec.get("source_dataset"),
                     "prompt": rec["prompt"],
                     "response": response,
-                    "tokens_generated": len(out.outputs[0].token_ids),
+                    "tokens_generated": len(completion.token_ids),
+                    "target_token_ids": list(completion.token_ids),
+                    "target_top_logprobs": serialize_generation_logprobs(
+                        getattr(completion, "logprobs", None)
+                    ),
+                    "top_logprobs_k": top_logprobs,
                     "prompt_tokens": rec.get("prompt_tokens"),
                     "metadata": rec.get("metadata", {}),
                 }
@@ -1365,7 +1393,7 @@ def main() -> None:
         description="Generate short-prompt distillation data for code/math/translation"
     )
     parser.add_argument("--samples_per_domain", type=int, default=80_000)
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3.5-9B")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-8B")
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--output_dir", type=str, default="./distillation_data")
     parser.add_argument("--domains", nargs="+",
@@ -1387,6 +1415,8 @@ def main() -> None:
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.85)
     parser.add_argument("--max_model_len", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_logprobs", type=int, default=64,
+                        help="Number of target-model generated-token logprobs to store per output token")
 
     # Code token-budget overrides (the new knobs for CodeSearchNet filtering).
     parser.add_argument("--code_max_prompt_tokens", type=int,
@@ -1463,6 +1493,7 @@ def main() -> None:
 ║  Code source:  CodeSearchNet Python (partial; no duplicate doc)    ║
 ║  Token limits  (code): doc={args.code_max_docstring_tokens} code={args.code_max_code_tokens} combined={args.code_max_combined_tokens}    ║
 ║  Max new toks  code/math/trans: {args.code_max_new_tokens}/{args.math_max_new_tokens}/{args.translation_max_new_tokens:<19}║
+║  Stored top-k logprobs: {args.top_logprobs:<34}║
 ╚════════════════════════════════════════════════════════════╝
 """)
 
@@ -1516,6 +1547,7 @@ def main() -> None:
             gpu_memory_utilization=args.gpu_memory_utilization,
             dtype=args.dtype,
             temperature=args.temperature,
+            top_logprobs=args.top_logprobs,
         )
 
         print("\n  [3/4] Filtering outputs...")

@@ -1,46 +1,14 @@
 #!/usr/bin/env python3
-"""
-finetune_draft.py — SFT fine-tuning of Qwen2.5-1.5B-Instruct as a
-speculative-decoding drafter aligned to Qwen2.5-14B-Instruct.
+"""Fine-tune a draft model with KL loss against stored target distributions.
 
-Reads from datasets/train_split/<domain>_train.jsonl (produced by prepare_eval_split.py).
-Loss is computed on response tokens only; prompt tokens are masked with -100.
-
-No chat template is applied — the distillation dataset was generated from raw
-text prompts (vLLM generate() called directly on the prompt string), so the
-drafter must learn the same raw prompt→response mapping the target uses.
-
-Resume behaviour:
-  On re-launch with the same --output_dir, the script auto-detects the latest
-  checkpoint-* directory and calls trainer.train(resume_from_checkpoint=...).
-  Pass --fresh to clear the output dir and start from scratch.
-  A dataset_manifest.json is saved on first run; resume aborts with a clear
-  error if --domains / --num_samples / --seed were changed.
-
-Usage:
-  python finetuning/finetune_draft.py \\
-      --domains code \\
-      --num_samples 50000 \\
-      --train_dir datasets/train_split \\
-      --output_dir checkpoints/code_50k \\
-      --epochs 1 \\
-      --save_steps 500
-
-  # Resume after a crash (same command, no --fresh):
-  python finetuning/finetune_draft.py \\
-      --domains code --num_samples 50000 \\
-      --output_dir checkpoints/code_50k --epochs 1
-
-  # Start over:
-  python finetuning/finetune_draft.py --fresh ...
+Rows are read from datasets/train_split/<domain>_train.jsonl. New dataset rows
+contain target_token_ids plus target_top_logprobs from dataset generation.
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
-import hashlib
-import importlib.metadata
 import importlib.util
 import json
 import os
@@ -49,136 +17,206 @@ import shutil
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import Dataset
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments,
-)
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
 
 DOMAINS = ["code", "math", "translation"]
 
 
-# ─────────────────────────────────────────────────────────
-# Data loading
-# ─────────────────────────────────────────────────────────
+def resolve_domains(values: list[str]) -> list[str]:
+    return list(DOMAINS) if "all" in values else sorted(set(values))
 
-def load_and_sample(
+
+def load_data(
     train_dir: str,
     domains: list[str],
-    num_samples_per_domain: int,
+    samples_per_domain: int,
     seed: int,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     rng = random.Random(seed)
-    all_rows: list[dict[str, str]] = []
+    all_rows: list[dict[str, Any]] = []
 
     for domain in domains:
         path = os.path.join(train_dir, f"{domain}_train.jsonl")
         if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"Training split not found: {path}\n"
-                "Run prepare_eval_split.py first."
-            )
-        rows: list[dict[str, str]] = []
+            raise FileNotFoundError(f"Training split not found: {path}\nRun prepare_eval_split.py first.")
+
+        rows: list[dict[str, Any]] = []
         with open(path, encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                if not line.strip():
                     continue
                 rec = json.loads(line)
-                rows.append({"prompt": rec["prompt"], "response": rec["response"]})
+                rec["domain"] = rec.get("domain", domain)
+                rows.append(rec)
 
         rng.shuffle(rows)
-        if len(rows) < num_samples_per_domain:
-            print(
-                f"  [{domain}] Only {len(rows):,} samples available "
-                f"(requested {num_samples_per_domain:,}); using all."
-            )
-        rows = rows[:num_samples_per_domain]
-        print(f"  [{domain}] Loaded {len(rows):,} training samples")
-        all_rows.extend(rows)
+        selected = rows[:samples_per_domain]
+        print(f"  [{domain}] Loaded {len(selected):,} samples")
+        all_rows.extend(selected)
 
     rng.shuffle(all_rows)
     return all_rows
 
 
-# ─────────────────────────────────────────────────────────
-# Dataset
-# ─────────────────────────────────────────────────────────
+def parse_top_logprobs(row: dict[str, Any]) -> tuple[list[int], list[list[int]], list[list[float]]]:
+    token_ids = [int(x) for x in row.get("target_token_ids") or []]
+    top_rows = row.get("target_top_logprobs") or []
+    top_ids: list[list[int]] = []
+    top_lps: list[list[float]] = []
 
-class PromptResponseDataset(Dataset):
-    """Tokenises prompt+response; labels -100 over prompt tokens."""
+    for entries in top_rows[:len(token_ids)]:
+        ids: list[int] = []
+        lps: list[float] = []
+        if isinstance(entries, list):
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                if "token_id" not in item or "logprob" not in item:
+                    continue
+                ids.append(int(item["token_id"]))
+                lps.append(float(item["logprob"]))
+        top_ids.append(ids)
+        top_lps.append(lps)
 
-    def __init__(self, rows: list[dict[str, str]], tokenizer, max_seq_len: int):
-        self.items: list[dict[str, list[int]]] = []
+    n = min(len(token_ids), len(top_ids), len(top_lps))
+    return token_ids[:n], top_ids[:n], top_lps[:n]
+
+
+class KLDistillationDataset(Dataset):
+    """Tokenizes prompts and attaches target top-k distributions by token index."""
+
+    def __init__(self, rows: list[dict[str, Any]], tokenizer: Any, max_seq_len: int, top_k: int):
+        self.items: list[dict[str, Any]] = []
         skipped = 0
+        no_kl = 0
 
         for row in rows:
-            prompt_ids = tokenizer.encode(row["prompt"], add_special_tokens=False)
-            resp_ids = tokenizer.encode(row["response"], add_special_tokens=False)
-            ids = prompt_ids + resp_ids
-
-            if len(ids) > max_seq_len:
-                ids = ids[:max_seq_len]
-
-            prompt_len = min(len(prompt_ids), len(ids))
-            if prompt_len >= len(ids):
+            prompt = row.get("prompt")
+            if not isinstance(prompt, str) or not prompt.strip():
                 skipped += 1
                 continue
 
-            labels = [-100] * prompt_len + ids[prompt_len:]
-            self.items.append({"input_ids": ids, "labels": labels})
+            prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+            response_ids, response_top_ids, response_top_lps = parse_top_logprobs(row)
+            if not response_ids:
+                response_text = row.get("response")
+                if not isinstance(response_text, str) or not response_text.strip():
+                    skipped += 1
+                    continue
+                response_ids = tokenizer.encode(response_text, add_special_tokens=False)
+                response_top_ids = []
+                response_top_lps = []
+                no_kl += 1
+
+            max_response_len = max(0, max_seq_len - len(prompt_ids))
+            if max_response_len <= 0:
+                skipped += 1
+                continue
+
+            response_ids = response_ids[:max_response_len]
+            input_ids = prompt_ids + response_ids
+            labels = [-100] * len(prompt_ids) + response_ids
+            seq_top_ids = [[-1] * top_k for _ in input_ids]
+            seq_top_lps = [[float("-inf")] * top_k for _ in input_ids]
+
+            for offset, (ids, lps) in enumerate(zip(response_top_ids, response_top_lps)):
+                pos = len(prompt_ids) + offset
+                if pos >= len(input_ids):
+                    break
+                k = min(top_k, len(ids), len(lps))
+                seq_top_ids[pos][:k] = ids[:k]
+                seq_top_lps[pos][:k] = lps[:k]
+
+            self.items.append({
+                "input_ids": input_ids,
+                "labels": labels,
+                "target_top_token_ids": seq_top_ids,
+                "target_top_logprobs": seq_top_lps,
+            })
 
         if skipped:
-            print(
-                f"  Skipped {skipped:,} rows where response was fully "
-                f"truncated at max_seq_len={max_seq_len}"
-            )
+            print(f"  Skipped {skipped:,} unusable/truncated rows")
+        if no_kl:
+            print(f"  Warning: {no_kl:,} rows had no stored top-logprobs; batches with only these rows use CE fallback")
 
     def __len__(self) -> int:
         return len(self.items)
 
-    def __getitem__(self, idx: int) -> dict[str, list[int]]:
+    def __getitem__(self, idx: int) -> dict[str, Any]:
         return self.items[idx]
 
 
-# ─────────────────────────────────────────────────────────
-# Collator
-# ─────────────────────────────────────────────────────────
-
-class SFTCollator:
-    """Right-pad input_ids and labels to the longest sequence in the batch."""
-
-    def __init__(self, pad_token_id: int):
+class KLCollator:
+    def __init__(self, pad_token_id: int, top_k: int):
         self.pad_token_id = pad_token_id
+        self.top_k = top_k
 
-    def __call__(self, batch: list[dict[str, list[int]]]) -> dict[str, torch.Tensor]:
+    def __call__(self, batch: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
         max_len = max(len(item["input_ids"]) for item in batch)
-        input_ids_list, labels_list, attn_mask_list = [], [], []
+        input_ids, labels, attention_mask = [], [], []
+        top_ids, top_lps = [], []
 
         for item in batch:
-            ids = item["input_ids"]
-            lbls = item["labels"]
-            pad_len = max_len - len(ids)
-            input_ids_list.append(ids + [self.pad_token_id] * pad_len)
-            labels_list.append(lbls + [-100] * pad_len)
-            attn_mask_list.append([1] * len(ids) + [0] * pad_len)
+            pad = max_len - len(item["input_ids"])
+            input_ids.append(item["input_ids"] + [self.pad_token_id] * pad)
+            labels.append(item["labels"] + [-100] * pad)
+            attention_mask.append([1] * len(item["input_ids"]) + [0] * pad)
+            top_ids.append(item["target_top_token_ids"] + [[-1] * self.top_k for _ in range(pad)])
+            top_lps.append(item["target_top_logprobs"] + [[float("-inf")] * self.top_k for _ in range(pad)])
 
         return {
-            "input_ids": torch.tensor(input_ids_list, dtype=torch.long),
-            "labels": torch.tensor(labels_list, dtype=torch.long),
-            "attention_mask": torch.tensor(attn_mask_list, dtype=torch.long),
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "target_top_token_ids": torch.tensor(top_ids, dtype=torch.long),
+            "target_top_logprobs": torch.tensor(top_lps, dtype=torch.float32),
         }
 
 
-# ─────────────────────────────────────────────────────────
-# Checkpoint helpers
-# ─────────────────────────────────────────────────────────
+class KLTrainer(Trainer):
+    def compute_loss(self, model: Any, inputs: dict[str, torch.Tensor], return_outputs: bool = False, **kwargs: Any):
+        top_ids = inputs.pop("target_top_token_ids")
+        target_lps = inputs.pop("target_top_logprobs")
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        shift_logits = logits[:, :-1, :].float()
+        shift_top_ids = top_ids[:, 1:, :]
+        shift_target_lps = target_lps[:, 1:, :]
+        valid = shift_top_ids >= 0
+        position_mask = valid.any(dim=-1)
+
+        if not bool(position_mask.any()):
+            if labels is None:
+                loss = logits.sum() * 0.0
+            else:
+                loss = F.cross_entropy(
+                    shift_logits.reshape(-1, shift_logits.size(-1)),
+                    labels[:, 1:].reshape(-1),
+                    ignore_index=-100,
+                )
+            return (loss, outputs) if return_outputs else loss
+
+        safe_ids = shift_top_ids.clamp_min(0)
+        draft_log_probs = F.log_softmax(shift_logits, dim=-1).gather(-1, safe_ids)
+        target_probs = torch.where(valid, shift_target_lps.exp(), torch.zeros_like(shift_target_lps))
+        mass = target_probs.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+        target_probs = target_probs / mass
+        target_log_probs = torch.where(
+            target_probs > 0,
+            target_probs.clamp_min(1e-20).log(),
+            torch.zeros_like(target_probs),
+        )
+        per_position_kl = (target_probs * (target_log_probs - draft_log_probs)).sum(dim=-1)
+        loss = per_position_kl[position_mask].mean()
+        return (loss, outputs) if return_outputs else loss
+
 
 def find_latest_checkpoint(output_dir: str) -> str | None:
-    pattern = os.path.join(output_dir, "checkpoint-*")
-    ckpt_dirs = glob.glob(pattern)
+    ckpt_dirs = glob.glob(os.path.join(output_dir, "checkpoint-*"))
     if not ckpt_dirs:
         return None
 
@@ -188,213 +226,63 @@ def find_latest_checkpoint(output_dir: str) -> str | None:
         except Exception:
             return -1
 
-    ckpt_dirs.sort(key=step_num)
-    return ckpt_dirs[-1]
+    return max(ckpt_dirs, key=step_num)
 
-
-# ─────────────────────────────────────────────────────────
-# Dataset manifest (guards against silent resume-with-wrong-data)
-# ─────────────────────────────────────────────────────────
-
-def _manifest_path(output_dir: str) -> str:
-    return os.path.join(output_dir, "dataset_manifest.json")
-
-
-def save_manifest(output_dir: str, args: Any) -> None:
-    manifest = {
-        "model_name": args.model_name,
-        "domains": sorted(args.domains),
-        "num_samples": args.num_samples,
-        "seed": args.seed,
-        "train_dir": str(args.train_dir),
-    }
-    with open(_manifest_path(output_dir), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-
-def check_manifest(output_dir: str, args: Any) -> None:
-    path = _manifest_path(output_dir)
-    if not os.path.exists(path):
-        return
-
-    with open(path, encoding="utf-8") as f:
-        saved = json.load(f)
-
-    errors: list[str] = []
-    if sorted(saved.get("domains", [])) != sorted(args.domains):
-        errors.append(f"domains: saved={saved.get('domains')} current={args.domains}")
-    if saved.get("num_samples") != args.num_samples:
-        errors.append(
-            f"num_samples: saved={saved.get('num_samples')} current={args.num_samples}"
-        )
-    if saved.get("seed") != args.seed:
-        errors.append(f"seed: saved={saved.get('seed')} current={args.seed}")
-
-    if errors:
-        raise ValueError(
-            f"Dataset manifest mismatch in {output_dir}! "
-            "Resume would train on different data.\n  "
-            + "\n  ".join(errors)
-            + "\n\nPass --fresh to start over, or restore the original CLI args."
-        )
-
-
-# ─────────────────────────────────────────────────────────
-# Environment checks
-# ─────────────────────────────────────────────────────────
-
-def _version_tuple(version: str) -> tuple[int, ...]:
-    parts: list[int] = []
-    for part in version.split("."):
-        digits = ""
-        for ch in part:
-            if not ch.isdigit():
-                break
-            digits += ch
-        if digits:
-            parts.append(int(digits))
-    return tuple(parts)
-
-
-def require_training_dependencies(use_lora: bool) -> None:
-    missing: list[str] = []
-    too_old: list[str] = []
-
-    if importlib.util.find_spec("accelerate") is None:
-        missing.append("accelerate>=0.26.0")
-    else:
-        version = importlib.metadata.version("accelerate")
-        if _version_tuple(version) < (0, 26, 0):
-            too_old.append(f"accelerate {version} installed, need >=0.26.0")
-
-    if use_lora and importlib.util.find_spec("peft") is None:
-        missing.append("peft>=0.12")
-
-    if not missing and not too_old:
-        return
-
-    details = []
-    if missing:
-        details.append("missing: " + ", ".join(missing))
-    if too_old:
-        details.append("too old: " + ", ".join(too_old))
-
-    packages = ["'accelerate>=0.26.0'"]
-    if use_lora:
-        packages.append("'peft>=0.12'")
-
-    raise SystemExit(
-        "Training dependencies are not ready (" + "; ".join(details) + ").\n"
-        "Install them, then re-run the same command:\n"
-        f"  pip install {' '.join(packages)} --break-system-packages"
-    )
-
-
-# ─────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="SFT fine-tuning of a Qwen2.5 drafter for speculative decoding"
-    )
-    parser.add_argument(
-        "--domains", nargs="+",
-        choices=DOMAINS + ["all"],
-        default=["all"],
-        help="Which domain(s) to train on. 'all' trains on code+math+translation.",
-    )
-    parser.add_argument(
-        "--num_samples", type=int, default=50_000,
-        help="Max samples per domain (randomly subsampled with --seed).",
-    )
-    parser.add_argument(
-        "--train_dir", type=str, default="datasets/train_split",
-        help="Directory containing <domain>_train.jsonl files.",
-    )
-    parser.add_argument(
-        "--output_dir", type=str, default="checkpoints/drafter",
-        help="Where to save checkpoints and the final model.",
-    )
-    parser.add_argument(
-        "--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct",
-    )
+    parser = argparse.ArgumentParser(description="KL fine-tune a Qwen3 draft model from target top-k distributions")
+    parser.add_argument("--domains", nargs="+", choices=DOMAINS + ["all"], default=["all"])
+    parser.add_argument("--num_samples", type=int, default=50_000, help="Samples per domain")
+    parser.add_argument("--train_dir", type=str, default="datasets/train_split")
+    parser.add_argument("--output_dir", type=str, default="checkpoints/all_50k_kl")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--epochs", type=float, default=1.0)
-    parser.add_argument("--batch_size", type=int, default=8,
-                        help="Per-device batch size.")
-    parser.add_argument("--grad_accum", type=int, default=4,
-                        help="Gradient accumulation steps. Effective batch = batch_size × grad_accum.")
+    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--grad_accum", type=int, default=4)
     parser.add_argument("--lr", type=float, default=2e-5)
     parser.add_argument("--max_seq_len", type=int, default=1024)
+    parser.add_argument("--top_k", type=int, default=64)
     parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument(
-        "--save_steps", type=int, default=500,
-        help="Save a checkpoint every N gradient-update steps.",
-    )
-    parser.add_argument(
-        "--save_total_limit", type=int, default=2,
-        help="Keep only the N most recent checkpoints on disk.",
-    )
+    parser.add_argument("--save_steps", type=int, default=500)
+    parser.add_argument("--save_total_limit", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--lora", action="store_true",
-        help="Use LoRA instead of full fine-tuning (saves memory, slightly weaker alignment).",
-    )
-    parser.add_argument(
-        "--fresh", action="store_true",
-        help="Delete output_dir and start from scratch (ignores any existing checkpoint).",
-    )
+    parser.add_argument("--lora", action="store_true")
+    parser.add_argument("--fresh", action="store_true")
     args = parser.parse_args()
+    args.domains = resolve_domains(args.domains)
 
-    # Resolve domains
-    args.domains = DOMAINS if "all" in args.domains else sorted(set(args.domains))
-    require_training_dependencies(args.lora)
+    if args.lora and importlib.util.find_spec("peft") is None:
+        raise SystemExit("peft is required for LoRA: pip install peft")
 
-    # Handle --fresh
     if args.fresh and os.path.exists(args.output_dir):
         print(f"  --fresh: removing {args.output_dir}")
         shutil.rmtree(args.output_dir)
-
     os.makedirs(args.output_dir, exist_ok=True)
-    check_manifest(args.output_dir, args)
 
     print(f"""
 ╔══════════════════════════════════════════════════════════╗
-║  Drafter Fine-Tuning                                      ║
-║  Model:    {args.model_name:<44}║
-║  Domains:  {", ".join(args.domains):<44}║
-║  Samples:  {args.num_samples:>7,} per domain                             ║
-║  Epochs:   {args.epochs:<44}║
-║  LR:       {args.lr:<44}║
-║  LoRA:     {str(args.lora):<44}║
-║  Output:   {args.output_dir:<44}║
+║  Draft Fine-Tuning with KL Distillation                  ║
+║  Draft:    {args.model_name:<45}║
+║  Domains:  {", ".join(args.domains):<45}║
+║  Samples:  {args.num_samples:,} per domain{' ' * 23}║
+║  Top-k:    {args.top_k:<45}║
+║  Output:   {args.output_dir:<45}║
 ╚══════════════════════════════════════════════════════════╝
 """)
 
-    # ── Load data ──────────────────────────────────────────────────────────────
-    print("[1/3] Loading training data...")
-    rows = load_and_sample(args.train_dir, args.domains, args.num_samples, args.seed)
-    print(f"  Total training rows: {len(rows):,}")
-    save_manifest(args.output_dir, args)
-
-    # ── Tokeniser ──────────────────────────────────────────────────────────────
-    print("\n[2/3] Loading tokeniser & model...")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name, trust_remote_code=True
-    )
+    rows = load_data(args.train_dir, args.domains, args.num_samples, args.seed)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    dataset = PromptResponseDataset(rows, tokenizer, args.max_seq_len)
+    dataset = KLDistillationDataset(rows, tokenizer, args.max_seq_len, args.top_k)
     print(f"  Dataset size after tokenisation: {len(dataset):,}")
 
-    # ── Model ──────────────────────────────────────────────────────────────────
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
-
     if args.lora:
         from peft import LoraConfig, TaskType, get_peft_model
         lora_cfg = LoraConfig(
@@ -402,15 +290,11 @@ def main() -> None:
             r=64,
             lora_alpha=128,
             lora_dropout=0.05,
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         )
         model = get_peft_model(model, lora_cfg)
         model.print_trainable_parameters()
 
-    # ── Trainer ────────────────────────────────────────────────────────────────
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -431,32 +315,22 @@ def main() -> None:
         report_to="none",
     )
 
-    collator = SFTCollator(pad_token_id=tokenizer.pad_token_id)
-
-    trainer = Trainer(
+    trainer = KLTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        data_collator=collator,
+        data_collator=KLCollator(tokenizer.pad_token_id, args.top_k),
         processing_class=tokenizer,
     )
 
-    # ── Resume ─────────────────────────────────────────────────────────────────
-    print("\n[3/3] Training...")
     last_ckpt = find_latest_checkpoint(args.output_dir)
-    if last_ckpt is not None:
-        print(f"  Resuming from checkpoint: {last_ckpt}")
-    else:
-        print("  Starting fresh training run.")
-
+    print(f"  Resuming from: {last_ckpt}" if last_ckpt else "  Starting fresh.")
     trainer.train(resume_from_checkpoint=last_ckpt)
 
-    # ── Save final model ───────────────────────────────────────────────────────
     final_path = os.path.join(args.output_dir, "final")
     trainer.save_model(final_path)
     tokenizer.save_pretrained(final_path)
-    print(f"\n  ✓ Final model saved to: {final_path}")
-    print(f"  Pass --drafter {final_path} to measure_acceptance.py")
+    print(f"\n  Model saved to: {final_path}")
 
 
 if __name__ == "__main__":

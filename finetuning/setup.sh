@@ -48,6 +48,7 @@ pip install \
   "huggingface_hub>=0.30.0" \
   "hf_transfer>=0.1.8" \
   "sentencepiece>=0.2.0" \
+  "fasttext>=0.9.3" \
   --break-system-packages
 
 # ── Verify ────────────────────────────────────────────────────────────────────
@@ -56,6 +57,7 @@ echo "=== Verification ==="
 python3 -c "import torch; print('torch :', torch.__version__, '| CUDA:', torch.version.cuda)"
 python3 -c "from vllm import LLM, SamplingParams; print('vLLM  : ok')"
 python3 -c "import transformers, peft; print('transformers:', transformers.__version__, '| peft:', peft.__version__)"
+python3 -c "import fasttext; print('fastText: ok')"
 python3 -c "import accelerate; print('accelerate  :', accelerate.__version__)"
 echo ""
 echo "Setup complete. GPU info:"

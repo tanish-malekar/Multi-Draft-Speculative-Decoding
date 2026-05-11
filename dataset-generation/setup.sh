@@ -32,7 +32,7 @@ pip install torch torchvision torchaudio \
 
 # Step 3: Install extra deps your script needs
 pip install "datasets>=3.6.0" "huggingface_hub>=0.30.0" "hf_transfer>=0.1.8" \
-  "accelerate>=1.6.0" "sentencepiece>=0.2.0" \
+  "accelerate>=1.6.0" "sentencepiece>=0.2.0" "fasttext>=0.9.3" \
   --break-system-packages
 
 # Step 4: Verify
